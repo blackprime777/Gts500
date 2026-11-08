@@ -6,7 +6,6 @@
 from __future__ import annotations
 import argparse
 import os
-import time
 import cmath
 import hashlib
 import json
@@ -19,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
-VERSION = "2.0.0"
+VERSION = "3.1.0"
 ASSETS = ("BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD")
 EPS = 1e-12
 
@@ -404,6 +403,204 @@ class HEDAEngine:
                              "Synthetic observations are generated internally and are not forecasts of real markets.",
                              "Risk figures are descriptive research metrics, not guarantees."]}}
 
+
+class ContinuousMarket:
+    """Persistent internally generated market stream with cross-asset shocks."""
+    STATES = ("CALM_UP", "CALM_DOWN", "TURBULENT", "RECOVERY")
+    TRANSITION = (
+        (.965, .012, .018, .005),
+        (.020, .950, .010, .020),
+        (.035, .015, .925, .025),
+        (.025, .020, .025, .930),
+    )
+
+    def __init__(self, seed=15501, warmup_bars=720):
+        self.seed = seed
+        self.rng = random.Random(seed + 991)
+        self.data = SyntheticMarket(seed, warmup_bars).generate()
+        self.regime_index = self.STATES.index(self.data.regimes[-1])
+        self.tick = 0
+        self.base_vol = dict(zip(ASSETS, (.010, .013, .020, .015, .018, .021)))
+        self.beta = dict(zip(ASSETS, (1.00, 1.18, 1.45, .92, 1.12, 1.28)))
+
+    def advance(self):
+        row = self.TRANSITION[self.regime_index]
+        if self.rng.random() > row[self.regime_index]:
+            choices = normalize([v if i != self.regime_index else 0.0
+                                 for i, v in enumerate(row)])
+            self.regime_index = self.rng.choices(range(4), weights=choices)[0]
+        regime = self.STATES[self.regime_index]
+        common = self.rng.gauss(0, 1)
+        shock = self.rng.gauss(0, 1) if regime == "TURBULENT" else 0.0
+        for symbol in ASSETS:
+            j = ASSETS.index(symbol)
+            drift = .00075 if regime in ("CALM_UP", "RECOVERY") else (
+                -.00055 if regime == "CALM_DOWN" else 0.0)
+            sigma = self.base_vol[symbol] * (2.7 if regime == "TURBULENT" else 1.0)
+            idio = self.rng.gauss(0, 1)
+            ret = clamp(drift + sigma * (
+                .52 * common * self.beta[symbol] + .25 * shock + .72 * idio
+            ), -.22, .22)
+            self.data.prices[symbol].append(
+                max(.01, self.data.prices[symbol][-1] * (1.0 + ret)))
+            volume = math.exp(10 + .8 * abs(common) + .65 * abs(idio)
+                              + (.9 if regime == "TURBULENT" else 0)
+                              + self.rng.gauss(0, .35))
+            self.data.volumes[symbol].append(volume)
+        self.data.regimes.append(regime)
+        self.data.bars += 1
+        self.tick += 1
+        # Bound memory while retaining sufficient lookback for all calculations.
+        keep = 900
+        for symbol in ASSETS:
+            if len(self.data.prices[symbol]) > keep + 1:
+                self.data.prices[symbol] = self.data.prices[symbol][-(keep + 1):]
+                self.data.volumes[symbol] = self.data.volumes[symbol][-keep:]
+        if len(self.data.regimes) > keep:
+            self.data.regimes = self.data.regimes[-keep:]
+        return regime
+
+
+def analyze_market_data(data, seed=15501, optimizer_iterations=350):
+    """Run the full state, coupling, graph, allocation and risk pipeline on current history."""
+    feature_engine = MarketFeatureEngine(data)
+    features = feature_engine.features()
+    regime = BayesianRegimeEngine().infer(features, data.regimes)
+    state_engine = StateVectorEngine()
+    raw = {s: state_engine.encode(f) for s, f in features.items()}
+    evolved = {s: state_engine.evolve(a) for s, a in raw.items()}
+    common = state_engine.interfere(list(evolved.values()))
+    amplitudes = {s: state_engine.interfere([evolved[s], common]) for s in evolved}
+    probabilities = {s: state_engine.probabilities(a) for s, a in amplitudes.items()}
+    pairs, pair_matrix = EntanglementInspiredEngine().network(
+        feature_engine.returns, amplitudes)
+    seed_scores = {s: abs(features[s]["trend"]) + .4 * abs(features[s]["momentum"])
+                   for s in features}
+    walk = QuantumWalkInspiredEngine().propagate(list(features), pair_matrix, seed_scores)
+    names = list(features)
+    expected = [features[s]["return"] * .35
+                + (probabilities[s][0] - probabilities[s][1]) * .0015 for s in names]
+    vols = [max(rolling_vol(feature_engine.returns[s], 80), .0001) for s in names]
+    cov = [[corr(feature_engine.returns[a][-100:], feature_engine.returns[b][-100:])
+            * vols[i] * vols[j] for j, b in enumerate(names)] for i, a in enumerate(names)]
+    for i in range(len(names)):
+        cov[i][i] = vols[i] ** 2
+    weights = EnergyLandscapeOptimizer().optimize(
+        names, expected, vols, cov, seed=seed, iterations=optimizer_iterations)
+    weights = dict(zip(names, normalize([.78 * weights[s] + .22 * walk[s] for s in names])))
+    risk = RiskEngine().evaluate(names, feature_engine.returns, weights, features, regime)
+    signals = {}
+    for symbol in names:
+        p = probabilities[symbol]
+        directional = p[0] - p[1]
+        confidence = clamp(max(p) - .25, 0, 1)
+        signal = "LONG_BIAS" if directional > .12 else (
+            "DEFENSIVE" if directional < -.12 else "NEUTRAL")
+        signals[symbol] = {
+            "signal": signal, "directional_score": directional,
+            "confidence_proxy": confidence, "weights": p,
+            "network_influence": walk[symbol], "allocation": weights[symbol],
+        }
+    norm_error = max(abs(sum(abs(x) ** 2 for x in a) - 1)
+                     for a in amplitudes.values())
+    return {
+        "version": VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "seed": seed, "bars": min(len(data.regimes), len(data.prices[names[0]]) - 1),
+        "assets": names, "regime_posterior": regime, "signals": signals,
+        "pair_network": pairs, "risk": risk, "features": features,
+        "portfolio_weights": weights,
+        "diagnostics": {
+            "data_source": "INTERNAL_CONTINUOUS_GENERATOR",
+            "live_data": False, "order_routing": False,
+            "state_vector_norm_error": norm_error,
+            "pair_count": len(pairs),
+            "optimizer_iterations": optimizer_iterations,
+            "notes": [
+                "Quantum-inspired computations are classical numerical methods.",
+                "Internally generated observations are not forecasts of real markets.",
+                "Risk figures are descriptive research metrics, not guarantees.",
+            ],
+        },
+    }
+
+
+class HEDALiveEngine:
+    """Continuous HEDA loop: advance market state, recompute intelligence, repeat."""
+    def __init__(self, seed=15501, warmup_bars=720, optimizer_iterations=350):
+        self.market = ContinuousMarket(seed, warmup_bars)
+        self.seed = seed
+        self.optimizer_iterations = optimizer_iterations
+        self.last_result = None
+
+    def step(self):
+        regime = self.market.advance()
+        self.last_result = analyze_market_data(
+            self.market.data,
+            seed=self.seed + self.market.tick,
+            optimizer_iterations=self.optimizer_iterations,
+        )
+        self.last_result["runtime"] = {
+            "tick": self.market.tick,
+            "current_generator_regime": regime,
+            "history_length": len(self.market.data.regimes),
+        }
+        return self.last_result
+
+
+def render_live_dashboard(result):
+    """Compact terminal dashboard refreshed on every engine cycle."""
+    clear()
+    bar = "═" * 76
+    print(paint(bar, CYAN))
+    center(paint("H E D A  //  CONTINUOUS QUANTUM-INSPIRED INTELLIGENCE", BOLD + WHITE), 76)
+    print(paint(bar, CYAN))
+    runtime = result["runtime"]
+    print(" ENGINE STATE : " + paint("RUNNING", GREEN)
+          + f"     TICK : {runtime['tick']}     HISTORY : {runtime['history_length']} bars")
+    print(f" UTC          : {result['timestamp_utc']}")
+    print(f" MARKET STATE : {runtime['current_generator_regime']} (internal data generator)")
+    print(f" STATE NORM Δ : {result['diagnostics']['state_vector_norm_error']:.3e}")
+    print(paint("─" * 76, DIM))
+    print(paint("[01] ADAPTIVE REGIME POSTERIOR", BOLD + YELLOW))
+    for name, probability in sorted(result["regime_posterior"].items(),
+                                    key=lambda item: item[1], reverse=True):
+        print(f" {name:<14} {probability:6.2%}  {'█' * int(probability * 38)}")
+    print(paint("─" * 76, DIM))
+    print(paint("[02] MULTI-ASSET STATE / INTERFERENCE / GRAPH OUTPUT", BOLD + YELLOW))
+    print(f" {'ASSET':<9} {'SIGNAL':<12} {'DIR':>7} {'CONF':>7} {'GRAPH':>7} {'WEIGHT':>8}")
+    for symbol, values in result["signals"].items():
+        print(f" {symbol:<9} {values['signal']:<12} "
+              f"{values['directional_score']:>+7.3f} "
+              f"{values['confidence_proxy']:>6.1%} "
+              f"{values['network_influence']:>6.1%} "
+              f"{values['allocation']:>7.2%}")
+    print(paint("─" * 76, DIM))
+    print(paint("[03] COUPLED ASSET-STATE NETWORK — STRONGEST LINKS", BOLD + YELLOW))
+    strongest = sorted(result["pair_network"],
+                       key=lambda item: item["concurrence"], reverse=True)[:5]
+    for pair in strongest:
+        print(f" {pair['asset_a']:<8} ↔ {pair['asset_b']:<8} "
+              f"corr={pair['correlation']:+.3f} "
+              f"coupling={pair['concurrence']:.3f} "
+              f"entropy={pair['entanglement_entropy_bits']:.3f} bits")
+    risk = result["risk"]
+    print(paint("─" * 76, DIM))
+    print(paint("[04] PORTFOLIO / RISK STATE", BOLD + YELLOW))
+    print(f" Volatility proxy : {risk['annualized_volatility_proxy']:.2%}   "
+          f"VaR 95%/bar : {risk['historical_var_95_per_bar']:.3%}")
+    print(f" Max drawdown    : {risk['max_drawdown']:.2%}   "
+          f"Concentration HHI : {risk['concentration_hhi']:.4f}")
+    if risk["warnings"]:
+        print(paint(" ALERTS : " + " | ".join(risk["warnings"]), RED))
+    else:
+        print(paint(" ALERTS : no configured threshold breached", GREEN))
+    print(paint("─" * 76, DIM))
+    print(" LOOP : recomputing each cycle | Ctrl+C = stop and return to HEDA menu")
+    print(" DATA : internally generated only | LIVE EXCHANGE FEED : OFF")
+    print(" EXECUTION : order routing disabled")
+    print(paint(bar, CYAN))
+
 def render_report(result):
     bar="═"*68
     print("\033[96m"+bar+"\033[0m")
@@ -626,16 +823,27 @@ def catalogue_view():
 
 def run_engine():
     logo()
-    print(paint("COMPUTATIONAL INTELLIGENCE ENGINE", BOLD + YELLOW))
-    print("Generating internal multi-asset market observations...")
-    print("Evolving complex state vectors and coupled dependency states...")
-    print("Running network propagation, allocation search and risk analysis...")
+    print(paint("CONTINUOUS COMPUTATIONAL INTELLIGENCE ENGINE", BOLD + YELLOW))
+    print("Initializing persistent six-asset market state...")
+    print("Warm-up history: 720 bars | Continuous cycles: unlimited")
+    print("Each cycle advances all assets and recomputes the intelligence pipeline.")
+    print("Press CTRL+C at any time to stop and return to the control panel.")
     try:
-        result = HEDAEngine(seed=15501, bars=720, optimizer_iterations=5000).run()
-        render_report(result)
+        engine = HEDALiveEngine(seed=15501, warmup_bars=720,
+                                optimizer_iterations=350)
+        while True:
+            result = engine.step()
+            render_live_dashboard(result)
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print(paint("\n\nHEDA CONTINUOUS ENGINE STOPPED BY OPERATOR.", YELLOW))
+        if 'engine' in locals() and engine.last_result:
+            print(f"Completed cycles: {engine.market.tick}")
+            print(f"Final history length: {len(engine.market.data.regimes)} bars")
     except Exception as exc:
-        print(paint(f"ENGINE ERROR: {exc}", RED))
-    input("\nPress ENTER to return to control panel...")
+        print(paint(f"\nENGINE ERROR: {type(exc).__name__}: {exc}", RED))
+        print("The engine stopped safely; no orders were sent.")
+        input("Press ENTER to return to control panel...")
 
 def about():
     logo()
@@ -659,7 +867,7 @@ def menu():
         clear()
         logo()
         print(paint("MAIN CONTROL PANEL", BOLD + YELLOW))
-        print("  [1]  RUN HEDA COMPUTATIONAL ENGINE")
+        print("  [1]  START CONTINUOUS HEDA ENGINE")
         print("  [2]  SYSTEM DASHBOARD")
         print("  [3]  OPEN 180-MODULE INTELLIGENCE LIBRARY")
         print("  [4]  ABOUT / SAFETY INFORMATION")
